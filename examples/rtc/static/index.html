@@ -1,0 +1,604 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>OpenAI Realtime Voice Chat</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background-color: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .controls {
+            margin: 20px 0;
+            padding: 20px;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            background-color: #fff;
+        }
+        button {
+            padding: 12px 24px;
+            margin: 5px;
+            font-size: 16px;
+            cursor: pointer;
+            border: none;
+            border-radius: 5px;
+            background-color: #007bff;
+            color: white;
+            transition: background-color 0.2s;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        button:disabled {
+            background-color: #ccc;
+            cursor: not-allowed;
+        }
+        #status {
+            margin: 10px 0;
+            padding: 10px;
+            border-radius: 5px;
+            font-weight: bold;
+        }
+        .connected {
+            background-color: #d4edda;
+            color: #155724;
+        }
+        .disconnected {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+        #transcript {
+            margin-top: 20px;
+            padding: 10px;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+            min-height: 100px;
+            max-height: 300px;
+            overflow-y: auto;
+            background-color: white;
+        }
+        .visualizer-container {
+            margin: 20px 0;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .visualizer {
+            height: 60px;
+            background-color: #000;
+            border-radius: 5px;
+            position: relative;
+            overflow: hidden;
+        }
+        .visualizer canvas {
+            width: 100%;
+            height: 100%;
+        }
+        .visualizer-label {
+            font-size: 14px;
+            color: #666;
+            margin-bottom: 5px;
+        }
+        .status-group {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px;
+            background-color: #f8f9fa;
+            border-radius: 5px;
+        }
+        .status-indicator {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            margin-right: 5px;
+        }
+        .speaking {
+            background-color: #28a745;
+            animation: pulse 1s infinite;
+        }
+        .silent {
+            background-color: #dc3545;
+        }
+        @keyframes pulse {
+            0% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.5; transform: scale(1.1); }
+            100% { opacity: 1; transform: scale(1); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>OpenAI Realtime Voice Chat</h1>
+        <div id="status" class="disconnected">Disconnected</div>
+        
+        <div class="visualizer-container">
+            <div>
+                <div class="visualizer-label">Your Voice</div>
+                <div class="visualizer">
+                    <canvas id="inputVisualizer"></canvas>
+                </div>
+            </div>
+            <div>
+                <div class="visualizer-label">AI Response</div>
+                <div class="visualizer">
+                    <canvas id="outputVisualizer"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <div class="controls">
+            <div class="status-group">
+                <span class="status-indicator silent" id="speechIndicator"></span>
+                <span id="speechStatus">Not speaking</span>
+            </div>
+            <button id="startButton">Start Conversation</button>
+            <button id="stopButton" disabled>Stop Conversation</button>
+        </div>
+        
+        <div id="transcript"></div>
+    </div>
+
+    <script>
+        let peerConnection;
+        let dataChannel;
+        let mediaStream;
+        let audioElement;
+        let currentResponseId = null;
+        let ws;
+        let messageQueue = [];
+        let isConnecting = false;
+        let reconnectAttempts = 0;
+        const MAX_RECONNECT_ATTEMPTS = 3;
+        const RECONNECT_DELAY = 2000; // 2 seconds
+        let audioContext;
+        let inputAnalyser;
+        let outputAnalyser;
+        let inputVisualizerCanvas;
+        let outputVisualizerCanvas;
+        let inputVisualizerCtx;
+        let outputVisualizerCtx;
+        let visualizationRunning = false;
+
+        const startButton = document.getElementById('startButton');
+        const stopButton = document.getElementById('stopButton');
+        const status = document.getElementById('status');
+        const transcript = document.getElementById('transcript');
+        const speechIndicator = document.getElementById('speechIndicator');
+        const speechStatus = document.getElementById('speechStatus');
+
+        function safeSendMessage(message) {
+            if (!dataChannel) {
+                console.warn('No data channel available');
+                return false;
+            }
+
+            if (dataChannel.readyState === 'open') {
+                try {
+                    const messageStr = typeof message === 'string' ? message : JSON.stringify(message);
+                    dataChannel.send(messageStr);
+                    return true;
+                } catch (error) {
+                    console.error('Error sending message:', error);
+                    return false;
+                }
+            } else {
+                console.warn(`Data channel not open (state: ${dataChannel.readyState})`);
+                messageQueue.push(message);
+                return false;
+            }
+        }
+
+        function processMessageQueue() {
+            while (messageQueue.length > 0 && dataChannel?.readyState === 'open') {
+                const message = messageQueue.shift();
+                safeSendMessage(message);
+            }
+        }
+
+        function addToTranscript(text, isUser = false, isPartial = false) {
+            const id = isPartial ? 'partial-transcript' : Date.now().toString();
+            const existingPartial = document.getElementById('partial-transcript');
+            
+            if (isPartial && existingPartial) {
+                existingPartial.textContent = `${isUser ? 'You' : 'AI'}: ${text}`;
+                return;
+            }
+            
+            if (existingPartial) {
+                existingPartial.remove();
+            }
+
+            const p = document.createElement('p');
+            p.id = id;
+            p.textContent = `${isUser ? 'You' : 'AI'}: ${text}`;
+            transcript.appendChild(p);
+            transcript.scrollTop = transcript.scrollHeight;
+        }
+
+        async function initializeWebRTC() {
+            if (isConnecting) {
+                console.log('Connection already in progress');
+                return;
+            }
+
+            try {
+                isConnecting = true;
+                reconnectAttempts++;
+
+                if (peerConnection) {
+                    peerConnection.close();
+                }
+                if (dataChannel) {
+                    dataChannel.close();
+                }
+
+                await setupWebRTC();
+
+            } catch (error) {
+                handleConnectionError(error.message);
+            } finally {
+                isConnecting = false;
+            }
+        }
+
+        function handleConnectionError(message, shouldReconnect = false) {
+            console.error('Connection error:', message);
+            status.textContent = 'Error: ' + message;
+            status.className = 'disconnected';
+
+            if (shouldReconnect && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+                console.log(`Attempting to reconnect (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
+                setTimeout(initializeWebRTC, RECONNECT_DELAY);
+            } else if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+                console.log('Max reconnection attempts reached');
+                stop();
+            }
+        }
+
+        async function setupAudioVisualizers() {
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            
+            // Input visualizer
+            inputVisualizerCanvas = document.getElementById('inputVisualizer');
+            inputVisualizerCtx = inputVisualizerCanvas.getContext('2d');
+            inputAnalyser = audioContext.createAnalyser();
+            inputAnalyser.fftSize = 256;
+            
+            // Output visualizer
+            outputVisualizerCanvas = document.getElementById('outputVisualizer');
+            outputVisualizerCtx = outputVisualizerCanvas.getContext('2d');
+            outputAnalyser = audioContext.createAnalyser();
+            outputAnalyser.fftSize = 256;
+
+            // Set canvas sizes
+            function resizeCanvases() {
+                [inputVisualizerCanvas, outputVisualizerCanvas].forEach(canvas => {
+                    canvas.width = canvas.offsetWidth * window.devicePixelRatio;
+                    canvas.height = canvas.offsetHeight * window.devicePixelRatio;
+                });
+            }
+            resizeCanvases();
+            window.addEventListener('resize', resizeCanvases);
+
+            // Start visualization loop
+            visualizationRunning = true;
+            drawVisualizers();
+        }
+
+        function drawVisualizers() {
+            if (!visualizationRunning) return;
+
+            // Draw input visualizer
+            if (inputAnalyser) {
+                const bufferLength = inputAnalyser.frequencyBinCount;
+                const dataArray = new Uint8Array(bufferLength);
+                inputAnalyser.getByteFrequencyData(dataArray);
+                drawVisualizer(inputVisualizerCtx, dataArray, '#00ff00');
+            }
+
+            // Draw output visualizer
+            if (outputAnalyser) {
+                const bufferLength = outputAnalyser.frequencyBinCount;
+                const dataArray = new Uint8Array(bufferLength);
+                outputAnalyser.getByteFrequencyData(dataArray);
+                drawVisualizer(outputVisualizerCtx, dataArray, '#00ffff');
+            }
+
+            requestAnimationFrame(drawVisualizers);
+        }
+
+        function drawVisualizer(ctx, dataArray, color) {
+            const canvas = ctx.canvas;
+            const width = canvas.width;
+            const height = canvas.height;
+            const barWidth = width / dataArray.length;
+
+            ctx.clearRect(0, 0, width, height);
+            ctx.fillStyle = color;
+
+            dataArray.forEach((value, i) => {
+                const percent = value / 255;
+                const barHeight = height * percent;
+                const x = i * barWidth;
+                const y = height - barHeight;
+                
+                ctx.beginPath();
+                ctx.moveTo(x, height);
+                ctx.lineTo(x + barWidth/2, y);
+                ctx.lineTo(x + barWidth, height);
+                ctx.closePath();
+                ctx.fill();
+            });
+        }
+
+        async function setupWebRTC() {
+            try {
+                // First get token from our server
+                const tokenResponse = await fetch('/rtc', {
+                    method: 'GET'
+                });
+
+                if (!tokenResponse.ok) {
+                    throw new Error('Failed to get token from server');
+                }
+
+                const { token } = await tokenResponse.json();
+                console.log('Received token from server');
+
+                // Get user media
+                mediaStream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    }
+                });
+
+                // Set up audio visualizers
+                await setupAudioVisualizers();
+
+                // Connect input audio to analyser
+                const micSource = audioContext.createMediaStreamSource(mediaStream);
+                micSource.connect(inputAnalyser);
+
+                // Create peer connection
+                peerConnection = new RTCPeerConnection({
+                    iceServers: [{
+                        urls: 'stun:stun.l.google.com:19302'
+                    }]
+                });
+
+                // Set up audio playback with visualization
+                audioElement = document.createElement('audio');
+                audioElement.autoplay = true;
+                
+                peerConnection.ontrack = (event) => {
+                    console.log('Received remote track:', event.track.kind);
+                    audioElement.srcObject = event.streams[0];
+                    
+                    // Connect output audio to analyser
+                    const audioSource = audioContext.createMediaStreamSource(event.streams[0]);
+                    audioSource.connect(outputAnalyser);
+                };
+
+                // Add connection state handling
+                peerConnection.onconnectionstatechange = () => {
+                    const state = peerConnection.connectionState;
+                    console.log("WebRTC connection state changed:", state);
+                    switch (state) {
+                        case "connected":
+                            console.log("WebRTC connected successfully");
+                            status.textContent = 'Connected - Speaking with AI';
+                            status.className = 'connected';
+                            startButton.disabled = true;
+                            stopButton.disabled = false;
+                            break;
+                        case "disconnected":
+                        case "failed":
+                            console.log("WebRTC connection failed or disconnected");
+                            status.textContent = 'Connection lost';
+                            status.className = 'disconnected';
+                            stop();
+                            break;
+                        case "closed":
+                            console.log("WebRTC connection closed");
+                            status.textContent = 'Disconnected';
+                            status.className = 'disconnected';
+                            break;
+                    }
+                };
+
+                peerConnection.onicegatheringstatechange = () => {
+                    console.log("ICE gathering state:", peerConnection.iceGatheringState);
+                };
+
+                peerConnection.oniceconnectionstatechange = () => {
+                    const state = peerConnection.iceConnectionState;
+                    console.log("ICE connection state:", state);
+                    if (state === 'failed') {
+                        console.log("ICE connection failed - attempting restart");
+                        peerConnection.restartIce();
+                    }
+                };
+
+                peerConnection.onicecandidate = (event) => {
+                    console.log("ICE candidate:", event.candidate);
+                };
+
+                // Add local audio track
+                mediaStream.getTracks().forEach(track => {
+                    peerConnection.addTrack(track, mediaStream);
+                });
+
+                // Create data channel for events
+                dataChannel = peerConnection.createDataChannel('oai-events');
+                dataChannel.onmessage = handleDataChannelMessage;
+
+                // Update data channel logging
+                dataChannel.onopen = () => {
+                    console.log("Data channel opened with readyState:", dataChannel.readyState);
+                    processMessageQueue();
+                    
+                    // Send session config
+                    const sessionConfig = {
+                        type: 'session.update',
+                        session: {
+                            turn_detection: {
+                                enabled: true,
+                                time_units_before_yield: 8,
+                                audio_energy_threshold: 0.1,
+                                speech_activity_threshold: 0.3,
+                                speech_duration_threshold: 0.5,
+                                create_response: true
+                            },
+                            instructions: 'You are a helpful AI assistant. Keep your responses concise and natural. Respond to voice input in a conversational manner.',
+                            output_audio_format: { type: 'wav', sample_rate: 24000 },
+                            input_audio_format: { type: 'wav', sample_rate: 24000 }
+                        }
+                    };
+                    console.log("Sending session config");
+                    safeSendMessage(sessionConfig);
+                };
+
+                dataChannel.onclose = () => {
+                    console.log("Data channel closed with readyState:", dataChannel.readyState);
+                };
+
+                dataChannel.onerror = (error) => {
+                    console.error("Data channel error:", error);
+                };
+
+                // Create and send offer
+                const offer = await peerConnection.createOffer();
+                await peerConnection.setLocalDescription(offer);
+
+                // Send offer directly to OpenAI
+                const openaiResponse = await fetch('https://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview-2024-12-17', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${token}`,
+                        'Content-Type': 'application/sdp'
+                    },
+                    body: offer.sdp
+                });
+
+                if (!openaiResponse.ok) {
+                    const errorText = await openaiResponse.text();
+                    throw new Error(`OpenAI error: ${errorText}`);
+                }
+
+                // Get and set remote description from OpenAI
+                const answerSdp = await openaiResponse.text();
+                if (!answerSdp.startsWith('v=0')) {
+                    throw new Error('Invalid SDP answer from OpenAI');
+                }
+
+                await peerConnection.setRemoteDescription({
+                    type: 'answer',
+                    sdp: answerSdp
+                });
+
+                console.log('WebRTC connection established with OpenAI');
+
+            } catch (error) {
+                console.error('Error setting up WebRTC:', error);
+                status.textContent = 'Error: ' + error.message;
+                status.className = 'disconnected';
+                throw error;
+            }
+        }
+
+        function handleDataChannelMessage(event) {
+            const message = JSON.parse(event.data);
+            console.log('Received message:', message);
+
+            switch (message.type) {
+                case 'text.created':
+                    addToTranscript(message.text.value, false);
+                    break;
+                    
+                case 'transcript.created':
+                    addToTranscript(message.transcript.text, true);
+                    break;
+
+                case 'response.audio_transcript.delta':
+                    if (message.delta?.text) {
+                        addToTranscript(message.delta.text, false, true);
+                    }
+                    break;
+
+                case 'input_audio_buffer.speech_started':
+                    speechIndicator.classList.remove('silent');
+                    speechIndicator.classList.add('speaking');
+                    speechStatus.textContent = 'Speaking';
+                    break;
+
+                case 'input_audio_buffer.speech_stopped':
+                    speechIndicator.classList.remove('speaking');
+                    speechIndicator.classList.add('silent');
+                    speechStatus.textContent = 'Not speaking';
+                    break;
+
+                case 'error':
+                    console.error('Server error:', message);
+                    addToTranscript(`Error: ${message.message}`, false);
+                    break;
+            }
+        }
+
+        async function start() {
+            try {
+                await initializeWebRTC();
+            } catch (error) {
+                console.error('Error starting conversation:', error);
+                status.textContent = 'Error: ' + error.message;
+                status.className = 'disconnected';
+            }
+        }
+
+        async function stop() {
+            visualizationRunning = false;
+            
+            if (mediaStream) {
+                mediaStream.getTracks().forEach(track => track.stop());
+            }
+            if (dataChannel) {
+                dataChannel.close();
+            }
+            if (peerConnection) {
+                peerConnection.close();
+            }
+            if (audioElement) {
+                audioElement.srcObject = null;
+            }
+            if (audioContext) {
+                await audioContext.close();
+            }
+
+            startButton.disabled = false;
+            stopButton.disabled = true;
+            status.textContent = 'Disconnected';
+            status.className = 'disconnected';
+            speechIndicator.classList.remove('speaking');
+            speechIndicator.classList.add('silent');
+            speechStatus.textContent = 'Not speaking';
+        }
+
+        startButton.onclick = start;
+        stopButton.onclick = stop;
+    </script>
+</body>
+</html> 
