@@ -21,7 +21,7 @@ type OpenAIAgent struct {
 	history []openai.ChatCompletionMessageParamUnion
 }
 
-func NewOpenAIAgent(id string, apiKey string, logger *zap.Logger) *OpenAIAgent {
+func NewOpenAIAgent(id string, apiKey string, logger *zap.Logger) Agent {
 	client := openai.NewClient(
 		option.WithAPIKey(apiKey),
 	)
